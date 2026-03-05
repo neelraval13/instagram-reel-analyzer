@@ -1,6 +1,7 @@
 # 🎬 Reel Analyzer
 
-**Drop an Instagram Reel. Ask anything. Get AI-powered analysis in seconds.**
+**Drop an Instagram Reel. Ask anything. Get AI-powered analysis in
+seconds.**
 
 Reel Analyzer downloads Instagram Reels, feeds them to a vision model,
 and returns a natural language analysis - all through a single API call.
@@ -130,36 +131,63 @@ docker run --rm -p 8000:8000 \
 
 ---
 
-## ☁️ Deploy to Railway
-
-1. Push this repo to GitHub
-2. [railway.app](https://railway.app) → **New Project** → **Deploy from
-   GitHub repo**
-3. Add environment variables in the **Variables** tab:
-   - `GEMINI_API_KEY`
-   - `API_BEARER_TOKEN`
-4. Railway auto-detects the Dockerfile, builds, and deploys
-5. Go to **Settings → Networking** → generate a public domain
-6. You're live 🎉
-
----
-
 ## 📱 iOS Shortcut
 
-Build a shortcut that lets you share a reel from Instagram and get
-analysis on your phone:
+Build a shortcut that lets you analyze reels from your phone in a few
+taps.
 
-1. **Receive** `URLs` from Share Sheet (fallback: Ask for URL)
-2. **Ask for Input** - "What do you want to know about this reel?"
-3. **Get Contents of URL** →
-   `POST https://your-railway-url.up.railway.app/analyze` with JSON body
-   and auth header
-4. **Get Dictionary Value** for `success`
-5. **If** `true` → **Show Result** with `analysis`
-6. **Otherwise** → **Show Alert** with `error`
+### Setup (step by step)
 
-**Settings:** Name it "Analyze Reel", enable "Show in Share Sheet" for
-URLs.
+1. Open **Shortcuts** → tap **+** → name it **Reel Analyzer**
+
+2. **Ask for Input** — type: `URL`, prompt: `Paste the Reel URL`
+
+3. **Set Variable** — name: `ReelURL`, value: `Provided Input`
+
+4. **Ask for Input** — type: `Text`, prompt:
+   `What do you want to know about this reel?`, default answer:
+   `What is happening in this video?`
+
+5. **Set Variable** — name: `UserPrompt`, value: `Provided Input`
+
+6. **Get Contents of URL** — configure:
+
+   | Field         | Value                                        |
+   | ------------- | -------------------------------------------- |
+   | URL           | `https://your-deployment-url.com/analyze`    |
+   | Method        | `POST`                                       |
+   | Request Body  | `JSON`                                       |
+
+   **Headers:**
+
+   | Key             | Value                  |
+   | --------------- | ---------------------- |
+   | `Authorization` | `Bearer <your-token>`  |
+   | `Content-Type`  | `application/json`     |
+
+   **JSON Body:**
+
+   | Key      | Type | Value          |
+   | -------- | ---- | -------------- |
+   | `url`    | Text | `ReelURL` var  |
+   | `prompt` | Text | `UserPrompt` var |
+
+7. **Get Dictionary Value** — get value for key `analysis` in
+   `Contents of URL`
+
+8. **Show Content** — display `Dictionary Value`
+
+### Action summary
+
+```text
+1. Ask for Input      → Paste the Reel URL
+2. Set Variable       → ReelURL
+3. Ask for Input      → What do you want to know?
+4. Set Variable       → UserPrompt
+5. Get Contents of URL → POST to /analyze with headers + JSON body
+6. Get Dictionary Value → extract "analysis"
+7. Show Content       → display the result
+```
 
 ---
 
