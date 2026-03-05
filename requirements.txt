@@ -1,0 +1,5 @@
+yt-dlp
+google-genai
+fastapi
+uvicorn
+pydantic-settings
