@@ -9,6 +9,10 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     qwen_model: str = "qwen2.5-vl:7b"
 
+    # Cache settings
+    cache_enabled: bool = True
+    cache_db_path: str = "./cache.db"
+
     model_config = {
         "env_file": ".env.local",
         "env_file_encoding": "utf-8",

@@ -8,6 +8,8 @@ from pydantic import BaseModel, HttpUrl
 
 from app.analyzer import get_analyzer
 from app.auth import verify_token
+from app.cache import extract_shortcode, get_cache
+from app.config import settings
 from app.downloader import download_reel
 from app.errors import ReelAnalyzerError
 from app.validators import validate_reel_url
@@ -35,24 +37,23 @@ class AnalyzeResponse(BaseModel):
     error: str | None = None
     error_type: str | None = None
     duration_seconds: float | None = None
+    cache_hit: bool = False
+    cache_layer: str | None = None  # "analysis" | None
 
 
 def _is_strict(request: Request) -> bool:
-    """Strict mode: map ReelAnalyzerError to its native HTTP status code.
-
-    Default (non-strict) returns 200 with success:false - this preserves
-    backwards compatibility with the existing iOS Shortcut, which only
-    checks the JSON body.
-    """
+    """Strict mode: map ReelAnalyzerError to its native HTTP status code."""
     return request.query_params.get("strict", "").lower() == "true"
+
+
+def _is_nocache(request: Request) -> bool:
+    """Client-requested cache bypass via ?nocache=true."""
+    return request.query_params.get("nocache", "").lower() == "true"
 
 
 @app.exception_handler(ReelAnalyzerError)
 async def handle_reel_error(request: Request, exc: ReelAnalyzerError) -> JSONResponse:
-    """Central handler for every known service error.
-
-    Logs once, renders consistently, respects ?strict= for status code.
-    """
+    """Central handler for every known service error."""
     logger.warning(
         "request_failed",
         extra={
@@ -75,32 +76,70 @@ async def handle_reel_error(request: Request, exc: ReelAnalyzerError) -> JSONRes
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(
     request: AnalyzeRequest,
+    fastapi_request: Request,
     _token: str = Depends(verify_token),
 ) -> AnalyzeResponse:
     start = time.time()
     video_path: str | None = None
+    nocache = _is_nocache(fastapi_request)
 
     try:
-        # Validate first so bad URLs never reach yt-dlp.
+        # Validate first so bad URLs never reach yt-dlp or the cache.
         url = validate_reel_url(str(request.url))
 
+        # --- Cache lookup -------------------------------------------------
+        cache = get_cache()
+        shortcode = extract_shortcode(url)
+
+        if cache is not None and shortcode is not None and not nocache:
+            cached = await cache.get(
+                shortcode=shortcode,
+                provider=settings.analyzer_provider,
+                model=_current_model(),
+                prompt=request.prompt,
+            )
+            if cached is not None:
+                duration = round(time.time() - start, 2)
+                return AnalyzeResponse(
+                    success=True,
+                    analysis=cached,
+                    duration_seconds=duration,
+                    cache_hit=True,
+                    cache_layer="analysis",
+                )
+
+        # --- Cache miss: full pipeline -----------------------------------
         video_path = await download_reel(url)
         analyzer = get_analyzer()
         result = await analyzer.analyze(video_path, request.prompt)
-        duration = round(time.time() - start, 2)
 
+        # --- Cache write -------------------------------------------------
+        if cache is not None and shortcode is not None:
+            # Fire-and-forget: don't let a cache write failure kill a
+            # successful analysis. Log and swallow.
+            try:
+                await cache.put(
+                    shortcode=shortcode,
+                    provider=settings.analyzer_provider,
+                    model=_current_model(),
+                    prompt=request.prompt,
+                    analysis=result,
+                )
+            except Exception:
+                logger.exception("cache_write_failed")
+
+        duration = round(time.time() - start, 2)
         return AnalyzeResponse(
             success=True,
             analysis=result,
             duration_seconds=duration,
+            cache_hit=False,
+            cache_layer=None,
         )
 
     except ReelAnalyzerError:
-        # Known errors - let the exception handler format them consistently.
         raise
-    except Exception as e:
-        # Genuine bugs (not domain errors). Log with stack trace and return
-        # a generic 500-equivalent so we don't leak internals to clients.
+    except Exception:
         logger.exception("unexpected_error")
         duration = round(time.time() - start, 2)
         return AnalyzeResponse(
@@ -113,3 +152,13 @@ async def analyze(
     finally:
         if video_path and os.path.exists(video_path):
             os.remove(video_path)
+
+
+def _current_model() -> str:
+    """The model identifier to use in cache keys, per configured provider."""
+    provider = settings.analyzer_provider.lower()
+    if provider == "gemini":
+        return settings.gemini_model
+    if provider == "qwen":
+        return settings.qwen_model
+    return provider
