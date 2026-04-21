@@ -1,11 +1,12 @@
+import asyncio
 import os
 import tempfile
 
 import yt_dlp
 
 
-def download_reel(url: str) -> str:
-    """Download an Instagram reel and return the file path."""
+def _download_sync(url: str) -> str:
+    """Blocking yt-dlp download; called via asyncio.to_thread."""
     fd, output_path = tempfile.mkstemp(suffix=".mp4")
     os.close(fd)
     os.remove(output_path)
@@ -24,3 +25,12 @@ def download_reel(url: str) -> str:
         raise RuntimeError(f"Download failed: file missing or empty at {output_path}")
 
     return output_path
+
+
+async def download_reel(url: str) -> str:
+    """Download an Instagram reel and return the file path.
+
+    yt-dlp is synchronous, so we run it in a worker thread to avoid
+    blocking the event loop.
+    """
+    return await asyncio.to_thread(_download_sync, url)

@@ -27,7 +27,7 @@ class AnalyzeResponse(BaseModel):
 
 
 @app.post("/analyze", response_model=AnalyzeResponse)
-def analyze(
+async def analyze(
     request: AnalyzeRequest,
     _token: str = Depends(verify_token),
 ) -> AnalyzeResponse:
@@ -35,9 +35,9 @@ def analyze(
     video_path: str | None = None
 
     try:
-        video_path = download_reel(str(request.url))
+        video_path = await download_reel(str(request.url))
         analyzer = get_analyzer()
-        result = analyzer.analyze(video_path, request.prompt)
+        result = await analyzer.analyze(video_path, request.prompt)
         duration = round(time.time() - start, 2)
 
         return AnalyzeResponse(

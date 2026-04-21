@@ -5,6 +5,6 @@ class BaseAnalyzer(ABC):
     """Abstract base for all video analysis providers."""
 
     @abstractmethod
-    def analyze(self, video_path: str, prompt: str) -> str:
+    async def analyze(self, video_path: str, prompt: str) -> str:
         """Analyze a video file and return the text response."""
         ...
