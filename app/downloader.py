@@ -22,6 +22,11 @@ from tenacity import (
     wait_exponential,
 )
 
+# yt-dlp re-exports DownloadError at the package root; using this
+# path keeps type checkers (Pyright/Pylance) happy while resolving
+# to the same class as yt_dlp.utils.DownloadError at runtime.
+from yt_dlp.utils import DownloadError as YtDlpDownloadError
+
 from app.errors import DownloadError, ReelAnalyzerError
 
 logger = logging.getLogger(__name__)
@@ -48,7 +53,7 @@ def _download_sync(url: str) -> str:
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore[arg-type]
             ydl.download([url])
-    except yt_dlp.utils.DownloadError as e:
+    except YtDlpDownloadError as e:
         raise DownloadError(f"yt-dlp failed: {e}") from e
     except Exception as e:
         # Any other failure from yt-dlp's innards - treat as retryable
