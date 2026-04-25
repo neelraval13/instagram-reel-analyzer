@@ -12,11 +12,12 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.types import ASGIApp
 
 from app.analyzer import get_analyzer
-from app.auth import verify_token
+from app.auth import verify_api_key
 from app.cache import FREEFORM_MODE, extract_shortcode, get_cache
 from app.config import settings
 from app.downloader import download_reel
 from app.errors import ReelAnalyzerError
+from app.keys import AuthContext
 from app.logging_config import (
     Event,
     bind_request_context,
@@ -170,11 +171,19 @@ async def handle_reel_error(request: Request, exc: ReelAnalyzerError) -> JSONRes
 async def analyze(
     request: AnalyzeRequest,
     fastapi_request: Request,
-    _token: str = Depends(verify_token),
+    auth: AuthContext = Depends(verify_api_key),
 ) -> AnalyzeResponse:
     start = time.time()
     video_path: str | None = None
     nocache = _is_nocache(fastapi_request)
+
+    # Re-bind user_id now that auth has resolved. The middleware bound it
+    # as None earlier; this overwrites with the actual value.
+    bind_request_context(
+        user_id=auth.user_id,
+        key_id=auth.key_id,
+        is_legacy_auth=auth.is_legacy,
+    )
 
     try:
         url = validate_reel_url(str(request.url))
