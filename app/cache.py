@@ -205,6 +205,7 @@ class AnalysisCache:
                     "provider": provider,
                     "model": model,
                     "output_mode": output_mode,
+                    "source": "analysis_cache",
                 },
             )
         return result

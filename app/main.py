@@ -1,12 +1,15 @@
 import json
 import logging
 import os
+import secrets
 import time
 from typing import Any
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, HttpUrl
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.types import ASGIApp
 
 from app.analyzer import get_analyzer
 from app.auth import verify_token
@@ -14,19 +17,86 @@ from app.cache import FREEFORM_MODE, extract_shortcode, get_cache
 from app.config import settings
 from app.downloader import download_reel
 from app.errors import ReelAnalyzerError
+from app.logging_config import (
+    Event,
+    bind_request_context,
+    clear_request_context,
+    configure_logging,
+)
 from app.schemas import SCHEMA_VERSION, ReelAnalysis
 from app.validators import validate_reel_url
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-)
+# Configure logging FIRST so even import-time errors come out as JSON.
+configure_logging()
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Reel Analyzer",
     description="Analyze Instagram Reels with AI",
 )
+
+
+# --- Middleware ------------------------------------------------------------
+
+
+def _generate_request_id() -> str:
+    """8-char hex request identifier."""
+    return secrets.token_hex(4)
+
+
+class RequestContextMiddleware(BaseHTTPMiddleware):
+    """Generate a request ID, bind it to log context, time the request,
+    add an X-Request-ID response header, and emit start/completed events.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        super().__init__(app)
+
+    async def dispatch(self, request: Request, call_next):
+        request_id = _generate_request_id()
+        start = time.time()
+
+        # Bind context BEFORE any handler code runs, so every log line
+        # emitted during this request automatically carries request_id
+        # and the request basics.
+        bind_request_context(
+            request_id=request_id,
+            method=request.method,
+            path=request.url.path,
+            user_id=None,  # populated once per-user keys land
+        )
+
+        logger.info(Event.REQUEST_STARTED)
+
+        try:
+            response = await call_next(request)
+        except Exception:
+            duration_ms = int((time.time() - start) * 1000)
+            logger.exception(
+                Event.REQUEST_FAILED,
+                extra={"duration_ms": duration_ms, "status": "exception"},
+            )
+            clear_request_context()
+            raise
+
+        duration_ms = int((time.time() - start) * 1000)
+        response.headers["X-Request-ID"] = request_id
+
+        logger.info(
+            Event.REQUEST_COMPLETED,
+            extra={
+                "duration_ms": duration_ms,
+                "status_code": response.status_code,
+            },
+        )
+        clear_request_context()
+        return response
+
+
+app.add_middleware(RequestContextMiddleware)
+
+
+# --- Models ----------------------------------------------------------------
 
 
 class AnalyzeRequest(BaseModel):
@@ -42,9 +112,8 @@ class AnalyzeResponse(BaseModel):
     In structured mode (when supported): `analysis_structured` is a dict,
                                          `analysis` is None.
     Hybrid fallback (structured requested but provider can't):
-        both `analysis` (string) is populated and `structured_available`
-        is False with a `fallback_reason` string. Clients that asked for
-        structured can detect this and render the freeform instead.
+        `analysis` (string) is populated and `structured_available`
+        is False with a `fallback_reason` string.
     """
 
     success: bool
@@ -59,6 +128,9 @@ class AnalyzeResponse(BaseModel):
     fallback_reason: str | None = None
 
 
+# --- Query param helpers ---------------------------------------------------
+
+
 def _is_strict(request: Request) -> bool:
     return request.query_params.get("strict", "").lower() == "true"
 
@@ -67,13 +139,16 @@ def _is_nocache(request: Request) -> bool:
     return request.query_params.get("nocache", "").lower() == "true"
 
 
+# --- Exception handler -----------------------------------------------------
+
+
 @app.exception_handler(ReelAnalyzerError)
 async def handle_reel_error(request: Request, exc: ReelAnalyzerError) -> JSONResponse:
     logger.warning(
-        "request_failed",
+        Event.REQUEST_FAILED,
         extra={
             "error_type": exc.__class__.__name__,
-            "error": str(exc),
+            "error_message": str(exc),
             "retryable": exc.retryable,
         },
     )
@@ -86,6 +161,9 @@ async def handle_reel_error(request: Request, exc: ReelAnalyzerError) -> JSONRes
             "error_type": exc.__class__.__name__,
         },
     )
+
+
+# --- Endpoint --------------------------------------------------------------
 
 
 @app.post("/analyze", response_model=AnalyzeResponse)
@@ -102,9 +180,6 @@ async def analyze(
         url = validate_reel_url(str(request.url))
 
         analyzer = get_analyzer()
-        # Decide what mode we can actually serve. If the client asked
-        # for structured and the provider can't, we fall back to
-        # freeform and flag it in the response.
         wants_structured = request.structured
         will_serve_structured = wants_structured and analyzer.supports_structured
         fallback_reason: str | None = None
@@ -114,16 +189,27 @@ async def analyze(
                 "structured output; returning freeform instead."
             )
             logger.info(
-                "structured_fallback",
-                extra={"provider": settings.analyzer_provider},
+                Event.PROVIDER_FALLBACK,
+                extra={
+                    "from_mode": "structured",
+                    "to_mode": "freeform",
+                    "provider": settings.analyzer_provider,
+                },
             )
 
         output_mode = SCHEMA_VERSION if will_serve_structured else FREEFORM_MODE
 
-        # --- Cache lookup -----------------------------------------------
-        cache = get_cache()
+        # Add per-request fields to log context so subsequent log lines
+        # in this request carry them too.
         shortcode = extract_shortcode(url)
+        bind_request_context(
+            shortcode=shortcode,
+            output_mode=output_mode,
+            provider=settings.analyzer_provider,
+        )
 
+        # --- Cache lookup ----------------------------------------------
+        cache = get_cache()
         if cache is not None and shortcode is not None and not nocache:
             cached = await cache.get(
                 shortcode=shortcode,
@@ -141,8 +227,15 @@ async def analyze(
                     structured_available=will_serve_structured,
                     fallback_reason=fallback_reason,
                 )
+            else:
+                logger.info(
+                    Event.CACHE_MISS,
+                    extra={"reason": "no_entry"},
+                )
+        elif nocache:
+            logger.info(Event.CACHE_MISS, extra={"reason": "client_bypass"})
 
-        # --- Cache miss: full pipeline ----------------------------------
+        # --- Cache miss: full pipeline ---------------------------------
         video_path = await download_reel(url)
 
         if will_serve_structured:
@@ -153,8 +246,6 @@ async def analyze(
             structured_dict: dict[str, Any] | None = structured_result.model_dump(
                 mode="json"
             )
-            # Cache the JSON-serialized form. Pydantic's model_dump_json
-            # handles Enum/datetime serialization for us.
             cache_value = structured_result.model_dump_json()
         else:
             freeform = await analyzer.analyze(video_path, request.prompt)
@@ -162,7 +253,6 @@ async def analyze(
             structured_dict = None
             cache_value = freeform
 
-        # --- Cache write ------------------------------------------------
         if cache is not None and shortcode is not None:
             try:
                 await cache.put(
@@ -174,7 +264,7 @@ async def analyze(
                     output_mode=output_mode,
                 )
             except Exception:
-                logger.exception("cache_write_failed")
+                logger.exception(Event.CACHE_WRITE_FAILED)
 
         duration = round(time.time() - start, 2)
         return AnalyzeResponse(
@@ -212,7 +302,6 @@ def _build_cached_response(
     structured_available: bool,
     fallback_reason: str | None,
 ) -> AnalyzeResponse:
-    """Turn a cached-string result back into the right response shape."""
     if output_mode == FREEFORM_MODE:
         return AnalyzeResponse(
             success=True,
@@ -224,15 +313,11 @@ def _build_cached_response(
             fallback_reason=fallback_reason,
         )
 
-    # Structured: cached value is JSON - parse and re-validate so we
-    # never ship malformed data to clients even if the cache is corrupt.
     try:
         data = json.loads(cached)
         validated = ReelAnalysis.model_validate(data)
     except Exception:
         logger.exception("cache_value_corrupt")
-        # Treat as cache miss - return error path and let the retry
-        # happen naturally on the next request.
         raise
 
     return AnalyzeResponse(

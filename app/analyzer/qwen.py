@@ -50,7 +50,10 @@ class QwenAnalyzer(BaseAnalyzer):
         reraise=True,
     )
     async def analyze(self, video_path: str, prompt: str) -> str:
-        logger.info("qwen_analyze_start", extra={"model": self._model})
+        logger.info(
+            "provider_call_started",
+            extra={"provider": "qwen", "model": self._model, "mode": "freeform"},
+        )
         video_b64 = await asyncio.to_thread(_read_and_encode, video_path)
 
         try:
@@ -106,5 +109,8 @@ class QwenAnalyzer(BaseAnalyzer):
         if not text:
             raise ProviderError("Qwen returned an empty response")
 
-        logger.info("qwen_analyze_success")
+        logger.info(
+            "provider_call_success",
+            extra={"provider": "qwen", "mode": "freeform"},
+        )
         return text

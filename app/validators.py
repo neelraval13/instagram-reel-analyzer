@@ -59,12 +59,12 @@ def validate_reel_url(url: str) -> str:
         if match:
             shortcode = match.group(1)
             logger.info(
-                "reel_url_validated",
+                "url_validated",
                 extra={"url_form": form, "shortcode": shortcode},
             )
             return url
 
-    logger.warning("reel_url_rejected", extra={"url": url})
+    logger.warning("url_rejected", extra={"url": url})
     raise InvalidReelURLError(
         f"Not a recognized Instagram reel URL: {url!r}. "
         "Expected instagram.com/reel/<id>, /reels/<id>, /p/<id>, "

@@ -48,6 +48,7 @@ def _download_sync(url: str) -> str:
         "format": "mp4",
         "quiet": True,
         "no_warnings": True,
+        "noprogress": True,  # suppress progress meter so log stream stays pure JSON
     }
 
     try:
@@ -78,11 +79,14 @@ async def download_reel(url: str) -> str:
     Retries transient failures up to 3 times with 1s/3s/9s backoff.
     Non-retryable errors (if any reach this layer) bubble up immediately.
     """
-    logger.info("reel_download_start", extra={"url": url})
+    logger.info("download_started", extra={"url": url})
     try:
         path = await asyncio.to_thread(_download_sync, url)
     except DownloadError:
-        logger.warning("reel_download_attempt_failed", extra={"url": url})
+        logger.warning("download_failed", extra={"url": url})
         raise
-    logger.info("reel_download_success", extra={"url": url, "path": path})
+    logger.info(
+        "download_success",
+        extra={"url": url, "path": path},
+    )
     return path

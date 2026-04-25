@@ -94,7 +94,10 @@ class GeminiAnalyzer(BaseAnalyzer):
         reraise=True,
     )
     async def analyze(self, video_path: str, prompt: str) -> str:
-        logger.info("gemini_analyze_start", extra={"model": self._model})
+        logger.info(
+            "provider_call_started",
+            extra={"provider": "gemini", "model": self._model, "mode": "freeform"},
+        )
 
         try:
             video_file = await self._upload_and_wait(video_path)
@@ -114,7 +117,10 @@ class GeminiAnalyzer(BaseAnalyzer):
         if response.text is None:
             raise ProviderError("Gemini returned an empty response")
 
-        logger.info("gemini_analyze_success")
+        logger.info(
+            "provider_call_success",
+            extra={"provider": "gemini", "mode": "structured"},
+        )
         return response.text
 
     @retry(
@@ -125,8 +131,8 @@ class GeminiAnalyzer(BaseAnalyzer):
     )
     async def analyze_structured(self, video_path: str, prompt: str) -> ReelAnalysis:
         logger.info(
-            "gemini_analyze_structured_start",
-            extra={"model": self._model},
+            "provider_call_started",
+            extra={"provider": "gemini", "model": self._model, "mode": "structured"},
         )
 
         try:
