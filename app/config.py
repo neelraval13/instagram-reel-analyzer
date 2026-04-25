@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     rate_limit_per_minute: int = 10
     rate_limit_per_day: int = 100
 
+    # Request body size cap (bytes). 32 KB is generous for any
+    # legitimate request given we cap prompt at 2000 chars.
+    max_body_bytes: int = 32 * 1024
+
     model_config = {
         "env_file": ".env.local",
         "env_file_encoding": "utf-8",

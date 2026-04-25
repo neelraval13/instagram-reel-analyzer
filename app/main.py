@@ -16,7 +16,7 @@ from app.auth import verify_api_key
 from app.cache import FREEFORM_MODE, extract_shortcode, get_cache
 from app.config import settings
 from app.downloader import download_reel
-from app.errors import ReelAnalyzerError
+from app.errors import PayloadTooLargeError, ReelAnalyzerError
 from app.keys import AuthContext
 from app.logging_config import (
     Event,
@@ -26,7 +26,7 @@ from app.logging_config import (
 )
 from app.rate_limit import RateLimitExceeded, get_rate_limiter
 from app.schemas import SCHEMA_VERSION, ReelAnalysis
-from app.validators import validate_reel_url
+from app.validators import validate_prompt, validate_reel_url
 
 # Configure logging FIRST so even import-time errors come out as JSON.
 configure_logging()
@@ -44,6 +44,41 @@ app = FastAPI(
 def _generate_request_id() -> str:
     """8-char hex request identifier."""
     return secrets.token_hex(4)
+
+
+class BodySizeLimitMiddleware(BaseHTTPMiddleware):
+    """Reject requests whose Content-Length exceeds settings.max_body_bytes.
+
+    Runs before RequestContextMiddleware so we don't waste a request ID
+    or any work on an obvious abuse/probe. Trusts Content-Length when
+    present; if absent (chunked encoding, etc.) we let the request
+    through and let downstream limits catch it.
+    """
+
+    def __init__(self, app: ASGIApp, max_bytes: int) -> None:
+        super().__init__(app)
+        self._max_bytes = max_bytes
+
+    async def dispatch(self, request: Request, call_next):
+        cl = request.headers.get("content-length")
+        if cl is not None:
+            try:
+                size = int(cl)
+            except ValueError:
+                size = 0
+            if size > self._max_bytes:
+                return JSONResponse(
+                    status_code=413,
+                    content={
+                        "success": False,
+                        "error": (
+                            f"Request body too large: {size} bytes "
+                            f"(max {self._max_bytes})."
+                        ),
+                        "error_type": "PayloadTooLargeError",
+                    },
+                )
+        return await call_next(request)
 
 
 class RequestContextMiddleware(BaseHTTPMiddleware):
@@ -96,6 +131,10 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
 
 
 app.add_middleware(RequestContextMiddleware)
+# Add body-size middleware AFTER RequestContextMiddleware so it runs
+# OUTERMOST - Starlette applies middleware in reverse-add order, so the
+# last-added middleware sees the request first.
+app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_body_bytes)
 
 
 # --- Models ----------------------------------------------------------------
@@ -240,6 +279,7 @@ async def analyze(
 
     try:
         url = validate_reel_url(str(request.url))
+        prompt = validate_prompt(request.prompt)
 
         analyzer = get_analyzer()
         wants_structured = request.structured
@@ -277,7 +317,7 @@ async def analyze(
                 shortcode=shortcode,
                 provider=settings.analyzer_provider,
                 model=_current_model(),
-                prompt=request.prompt,
+                prompt=prompt,
                 output_mode=output_mode,
             )
             if cached is not None:
@@ -301,16 +341,14 @@ async def analyze(
         video_path = await download_reel(url)
 
         if will_serve_structured:
-            structured_result = await analyzer.analyze_structured(
-                video_path, request.prompt
-            )
+            structured_result = await analyzer.analyze_structured(video_path, prompt)
             analysis_str: str | None = None
             structured_dict: dict[str, Any] | None = structured_result.model_dump(
                 mode="json"
             )
             cache_value = structured_result.model_dump_json()
         else:
-            freeform = await analyzer.analyze(video_path, request.prompt)
+            freeform = await analyzer.analyze(video_path, prompt)
             analysis_str = freeform
             structured_dict = None
             cache_value = freeform
@@ -321,7 +359,7 @@ async def analyze(
                     shortcode=shortcode,
                     provider=settings.analyzer_provider,
                     model=_current_model(),
-                    prompt=request.prompt,
+                    prompt=prompt,
                     analysis=cache_value,
                     output_mode=output_mode,
                 )

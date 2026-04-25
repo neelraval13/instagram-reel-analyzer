@@ -30,6 +30,20 @@ class InvalidReelURLError(ReelAnalyzerError):
     retryable = False
 
 
+class InvalidPromptError(ReelAnalyzerError):
+    """The prompt is empty, whitespace-only, or exceeds size limits."""
+
+    http_status = 400
+    retryable = False
+
+
+class PayloadTooLargeError(ReelAnalyzerError):
+    """The request body exceeds the configured size cap."""
+
+    http_status = 413
+    retryable = False
+
+
 # --- Download errors --------------------------------------------------------
 
 
