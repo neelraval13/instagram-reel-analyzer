@@ -13,6 +13,10 @@ class Settings(BaseSettings):
     cache_enabled: bool = True
     cache_db_path: str = "./cache.db"
 
+    # Rate limit settings (per user, both must pass)
+    rate_limit_per_minute: int = 10
+    rate_limit_per_day: int = 100
+
     model_config = {
         "env_file": ".env.local",
         "env_file_encoding": "utf-8",

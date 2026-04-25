@@ -24,6 +24,7 @@ from app.logging_config import (
     clear_request_context,
     configure_logging,
 )
+from app.rate_limit import RateLimitExceeded, get_rate_limiter
 from app.schemas import SCHEMA_VERSION, ReelAnalysis
 from app.validators import validate_reel_url
 
@@ -164,6 +165,58 @@ async def handle_reel_error(request: Request, exc: ReelAnalyzerError) -> JSONRes
     )
 
 
+@app.exception_handler(RateLimitExceeded)
+async def handle_rate_limit(request: Request, exc: RateLimitExceeded) -> JSONResponse:
+    logger.warning(
+        "rate_limit_exceeded",
+        extra={
+            "user_id": exc.user_id,
+            "kind": exc.kind,
+            "limit": exc.limit,
+            "current": exc.current,
+            "retry_after_seconds": exc.retry_after_seconds,
+        },
+    )
+    return JSONResponse(
+        status_code=429,
+        content={
+            "success": False,
+            "error": (
+                f"Rate limit exceeded ({exc.kind}): "
+                f"{exc.current} requests, limit {exc.limit}. "
+                f"Retry in {exc.retry_after_seconds}s."
+            ),
+            "error_type": "RateLimitExceeded",
+            "limit_kind": exc.kind,
+            "limit": exc.limit,
+            "current": exc.current,
+            "retry_after_seconds": exc.retry_after_seconds,
+        },
+        headers={"Retry-After": str(exc.retry_after_seconds)},
+    )
+
+
+# --- Rate limit dependency ------------------------------------------------
+
+
+async def enforce_rate_limit(
+    auth: AuthContext = Depends(verify_api_key),
+) -> AuthContext:
+    """Increment + check the caller's rate limit counters.
+
+    Raises RateLimitExceeded (mapped to 429) if either limit is over.
+    Returns AuthContext on success so the endpoint can keep using it -
+    FastAPI dedupes Depends(verify_api_key) within one request, so this
+    is the same AuthContext the endpoint sees.
+    """
+    status = await get_rate_limiter().check_and_increment(auth.user_id)
+    bind_request_context(
+        rate_limit_minute=status.minute_count,
+        rate_limit_day=status.day_count,
+    )
+    return auth
+
+
 # --- Endpoint --------------------------------------------------------------
 
 
@@ -171,7 +224,7 @@ async def handle_reel_error(request: Request, exc: ReelAnalyzerError) -> JSONRes
 async def analyze(
     request: AnalyzeRequest,
     fastapi_request: Request,
-    auth: AuthContext = Depends(verify_api_key),
+    auth: AuthContext = Depends(enforce_rate_limit),
 ) -> AnalyzeResponse:
     start = time.time()
     video_path: str | None = None
