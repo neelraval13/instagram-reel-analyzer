@@ -11,6 +11,7 @@ from pydantic import BaseModel, HttpUrl
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.types import ASGIApp
 
+from app.admin import router as admin_router
 from app.analyzer import get_analyzer
 from app.auth import verify_api_key
 from app.cache import FREEFORM_MODE, extract_shortcode, get_cache
@@ -138,6 +139,7 @@ app.add_middleware(RequestContextMiddleware)
 app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_body_bytes)
 
 app.include_router(health_router)
+app.include_router(admin_router)
 
 
 # --- Models ----------------------------------------------------------------

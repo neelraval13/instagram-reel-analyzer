@@ -21,6 +21,11 @@ class Settings(BaseSettings):
     # legitimate request given we cap prompt at 2000 chars.
     max_body_bytes: int = 32 * 1024
 
+    # Admin endpoint auth. Empty string disables /admin/* entirely
+    # (the endpoints return 404). Set this in production to enable
+    # remote key management.
+    admin_token: str = ""
+
     model_config = {
         "env_file": ".env.local",
         "env_file_encoding": "utf-8",

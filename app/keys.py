@@ -184,7 +184,7 @@ class KeyStore:
     def _revoke_sync(self, key_id: int) -> bool:
         with self._connect() as conn:
             cur = conn.execute(
-                "UPDATE api_keys SET active = 0 WHERE id = ?",
+                "UPDATE api_keys SET active = 0 WHERE id = ? AND active = 1",
                 (key_id,),
             )
             conn.commit()
@@ -200,7 +200,7 @@ class KeyStore:
             extra={
                 "key_id": issued.key_id,
                 "user_id": issued.user_id,
-                "name": issued.name,
+                "key_name": issued.name,
             },
         )
         return issued
