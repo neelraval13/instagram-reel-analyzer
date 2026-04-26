@@ -1,4 +1,4 @@
-"""Per-user rate limiting backed by SQLite.
+"""Per-user rate limiting backed by Redis.
 
 Two limits enforced in parallel:
 
@@ -11,11 +11,14 @@ A request must pass BOTH to proceed. If either is exceeded, we raise
 RateLimitExceeded which the FastAPI exception handler maps to HTTP 429
 with a Retry-After header.
 
-Algorithm: fixed-window counters. A bucket is the wall-clock minute
-or day the request lands in (UTC). The (user_id, kind, window_start)
-row carries a count; we INSERT-or-UPDATE-add-one atomically. Boundary
-bursts are theoretically possible (last second of minute X plus first
-second of minute X+1) but irrelevant at our scale.
+Algorithm: fixed-window counters using Redis INCR + EXPIRE. A bucket is
+the wall-clock minute or day the request lands in (UTC). Two atomic ops:
+INCR creates-or-increments the counter; EXPIRE sets a TTL so old buckets
+self-clean.
+
+The TTL slightly exceeds the window length so we don't accidentally
+forget the count if a request lands in the very last microsecond of a
+bucket (would only matter under extreme contention; harmless either way).
 
 Counting policy: this dependency runs AFTER verify_api_key, so pre-auth
 failures (401, missing header, malformed JSON before our handler even
@@ -24,19 +27,28 @@ already did the work of authenticating and validating, and the user
 got their answer (even a 502 is a real resource use).
 """
 
-import asyncio
 import logging
-import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Literal
 
 from app.config import settings
+from app.redis_client import get_redis
 
 logger = logging.getLogger(__name__)
 
 
 WindowKind = Literal["minute", "day"]
+
+# Redis key prefixes
+_K_RL_MINUTE = "rl:m:"  # rl:m:<user>:<YYYY-MM-DDTHH:MM>
+_K_RL_DAY = "rl:d:"  # rl:d:<user>:<YYYY-MM-DD>
+
+# TTLs are slightly longer than the window to avoid edge-case off-by-one
+# wraparound. Redis applies expirations lazily anyway, so a few extra
+# seconds are inconsequential.
+_TTL_MINUTE_SECONDS = 90  # window is 60s, give 30s grace
+_TTL_DAY_SECONDS = 90_000  # window is 86400s, give ~1h grace
 
 
 class RateLimitExceeded(Exception):
@@ -74,118 +86,66 @@ class RateLimitStatus:
 
 
 def _minute_window(now: datetime) -> str:
-    """Truncate to the start of the current minute, ISO formatted."""
-    return now.replace(second=0, microsecond=0).isoformat()
+    """Truncate to the start of the current minute."""
+    return now.strftime("%Y-%m-%dT%H:%M")
 
 
 def _day_window(now: datetime) -> str:
-    """Truncate to UTC midnight of the current day, ISO formatted."""
-    return now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    """Truncate to UTC date."""
+    return now.strftime("%Y-%m-%d")
 
 
 def _seconds_until_minute_rollover(now: datetime) -> int:
-    """How many seconds until the current minute bucket resets."""
     return 60 - now.second
 
 
 def _seconds_until_day_rollover(now: datetime) -> int:
-    """How many seconds until UTC midnight."""
     seconds_today = now.hour * 3600 + now.minute * 60 + now.second
     return max(1, 86400 - seconds_today)
 
 
 class RateLimiter:
-    """SQLite-backed rate limit counters.
+    """Redis-backed rate limit counters.
 
-    One row per (user_id, kind, window_start). Atomic upsert via SQLite's
-    INSERT ... ON CONFLICT DO UPDATE keeps increments race-safe even
-    under concurrent requests for the same user.
+    One key per (user, window). INCR is naturally atomic (no read-modify-
+    write race), and EXPIRE auto-cleans old windows so we don't leak
+    keys forever the way SQLite would have without a cron job.
     """
 
-    def __init__(
-        self,
-        db_path: str,
-        burst_limit: int,
-        daily_limit: int,
-    ) -> None:
-        self._db_path = db_path
+    def __init__(self, burst_limit: int, daily_limit: int) -> None:
         self._burst_limit = burst_limit
         self._daily_limit = daily_limit
-        self._init_schema()
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._db_path, check_same_thread=False)
-        conn.execute("PRAGMA journal_mode=WAL")
-        return conn
+    async def check_and_increment(self, user_id: str) -> RateLimitStatus:
+        """Increment counters for the current request and check both limits.
 
-    def _init_schema(self) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS rate_limits (
-                    user_id      TEXT NOT NULL,
-                    window_kind  TEXT NOT NULL,
-                    window_start TEXT NOT NULL,
-                    count        INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY (user_id, window_kind, window_start)
-                )
-                """
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_rate_limits_user_kind "
-                "ON rate_limits (user_id, window_kind, window_start)"
-            )
-            conn.commit()
+        Raises RateLimitExceeded if either limit would be breached.
+        Otherwise returns the post-increment status for logging.
 
-    def _check_and_increment_sync(self, user_id: str, now: datetime) -> RateLimitStatus:
-        minute_start = _minute_window(now)
-        day_start = _day_window(now)
+        Both buckets are incremented before either is checked. We want
+        attempts to count toward the limit, even if the limit is the
+        thing they're hitting - this is standard rate-limiter semantics
+        (Stripe, GitHub, AWS all behave this way).
+        """
+        client = get_redis()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        minute_key = f"{_K_RL_MINUTE}{user_id}:{_minute_window(now)}"
+        day_key = f"{_K_RL_DAY}{user_id}:{_day_window(now)}"
 
-        with self._connect() as conn:
-            # Atomic upsert + increment for the minute bucket.
-            conn.execute(
-                """
-                INSERT INTO rate_limits (user_id, window_kind, window_start, count)
-                VALUES (?, 'minute', ?, 1)
-                ON CONFLICT (user_id, window_kind, window_start)
-                DO UPDATE SET count = count + 1
-                """,
-                (user_id, minute_start),
-            )
-            cur = conn.execute(
-                """
-                SELECT count FROM rate_limits
-                WHERE user_id = ? AND window_kind = 'minute' AND window_start = ?
-                """,
-                (user_id, minute_start),
-            )
-            row = cur.fetchone()
-            minute_count = row[0] if row else 1
+        # Pipeline both increments + their TTLs. One round trip.
+        # EXPIRE is idempotent - calling it on an existing key resets
+        # the TTL, which is fine since we want it to outlive the window.
+        async with client.pipeline(transaction=False) as pipe:
+            pipe.incr(minute_key)
+            pipe.expire(minute_key, _TTL_MINUTE_SECONDS)
+            pipe.incr(day_key)
+            pipe.expire(day_key, _TTL_DAY_SECONDS)
+            results = await pipe.execute()
 
-            # Same for the day bucket.
-            conn.execute(
-                """
-                INSERT INTO rate_limits (user_id, window_kind, window_start, count)
-                VALUES (?, 'day', ?, 1)
-                ON CONFLICT (user_id, window_kind, window_start)
-                DO UPDATE SET count = count + 1
-                """,
-                (user_id, day_start),
-            )
-            cur = conn.execute(
-                """
-                SELECT count FROM rate_limits
-                WHERE user_id = ? AND window_kind = 'day' AND window_start = ?
-                """,
-                (user_id, day_start),
-            )
-            row = cur.fetchone()
-            day_count = row[0] if row else 1
+        # results is [minute_count, expire_ok, day_count, expire_ok]
+        minute_count = int(results[0])
+        day_count = int(results[2])
 
-            conn.commit()
-
-        # Check both limits AFTER incrementing. If we're over, the increment
-        # stands - we want the count to reflect attempts, not just successes.
         if minute_count > self._burst_limit:
             raise RateLimitExceeded(
                 user_id=user_id,
@@ -210,15 +170,6 @@ class RateLimiter:
             day_limit=self._daily_limit,
         )
 
-    async def check_and_increment(self, user_id: str) -> RateLimitStatus:
-        """Increment counters for the current request and check both limits.
-
-        Raises RateLimitExceeded if either limit would be breached.
-        Otherwise returns the post-increment status for logging.
-        """
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
-        return await asyncio.to_thread(self._check_and_increment_sync, user_id, now)
-
 
 # --- Module-level singleton ------------------------------------------------
 
@@ -229,7 +180,6 @@ def get_rate_limiter() -> RateLimiter:
     global _limiter_instance
     if _limiter_instance is None:
         _limiter_instance = RateLimiter(
-            db_path=settings.cache_db_path,
             burst_limit=settings.rate_limit_per_minute,
             daily_limit=settings.rate_limit_per_day,
         )

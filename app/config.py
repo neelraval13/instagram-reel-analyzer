@@ -11,7 +11,15 @@ class Settings(BaseSettings):
 
     # Cache settings
     cache_enabled: bool = True
-    cache_db_path: str = "./cache.db"
+
+    # Redis connection. Required for keystore, rate limits, and cache.
+    # Format: rediss://default:<password>@<host>:<port> for TLS,
+    # or redis://localhost:6379 for local dev with redis-server.
+    redis_url: str = "redis://localhost:6379"
+
+    # TTL for cached analyses (seconds). 30 days = re-analyze stale data
+    # naturally; also bounds Redis memory usage.
+    analysis_cache_ttl_seconds: int = 30 * 24 * 60 * 60
 
     # Rate limit settings (per user, both must pass)
     rate_limit_per_minute: int = 10

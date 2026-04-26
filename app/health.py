@@ -1,10 +1,8 @@
 """Health and readiness endpoints.
 
-Two endpoints with deliberately different semantics:
-
     GET /health  - "is the process alive and accepting requests?"
                    Always 200 if the process can answer at all. No
-                   external checks. Used by Railway/load balancers
+                   external checks. Used by Render/load balancers
                    to decide whether to restart the container.
 
     GET /ready   - "can this instance actually serve requests?"
@@ -12,45 +10,45 @@ Two endpoints with deliberately different semantics:
                    working, 503 with details if anything is broken.
                    Used for deploy gates and debugging.
 
-The split matters: a transient cache hiccup should NOT trigger a
+The split matters: a transient Redis hiccup should NOT trigger a
 container restart (which would make things worse). It should mark
-the instance unready so traffic can drain elsewhere if available,
-and so an alert fires for investigation - while /health stays 200
-because the process itself is fine.
+the instance unready - while /health stays 200 because the process
+itself is fine.
 """
 
 import logging
-import sqlite3
-from typing import Any
+from typing import Any, Awaitable, cast
 
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
 from app.analyzer import get_analyzer
-from app.cache import get_cache
-from app.config import settings
-from app.keys import get_keystore
+from app.redis_client import get_redis
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["health"])
 
 
-def _check_sqlite(db_path: str, table: str) -> str:
-    """Open a fresh connection and run a tiny query against the named
-    table. Returns 'ok' or a short error description.
+async def _check_redis() -> str:
+    """PING Redis. Timeout is enforced at the client level via
+    socket_timeout in redis_client.py, so we don't need to wrap this
+    in asyncio.wait_for - a stuck connection will raise TimeoutError
+    after socket_timeout seconds.
+
+    The cast() is needed because redis-py's type stubs annotate ping()
+    as returning Awaitable[bool] | bool (a union covering both sync and
+    async clients in one signature). At runtime the async client always
+    returns an awaitable, but the type checker can't prove that.
+
+    Returns 'ok' or a short error description.
     """
     try:
-        conn = sqlite3.connect(db_path, timeout=2.0)
-        try:
-            conn.execute(f"SELECT 1 FROM {table} LIMIT 1")
-        finally:
-            conn.close()
+        client = get_redis()
+        await cast(Awaitable[bool], client.ping())
         return "ok"
-    except sqlite3.Error as e:
-        return f"sqlite error: {e}"
     except Exception as e:  # noqa: BLE001 - defensive
-        return f"unexpected error: {e}"
+        return f"{type(e).__name__}: {e}"
 
 
 def _check_analyzer() -> str:
@@ -83,19 +81,14 @@ async def ready() -> JSONResponse:
     """
     checks: dict[str, Any] = {}
 
-    # Cache (the table only exists if cache is enabled, so skip if not).
-    if settings.cache_enabled:
-        checks["cache"] = _check_sqlite(settings.cache_db_path, "analysis_cache")
-    else:
-        checks["cache"] = "disabled"
-
-    # Keystore - same DB file, separate table.
-    checks["keystore"] = _check_sqlite(settings.cache_db_path, "api_keys")
+    # Redis is the single backing store for keystore + rate limits + cache.
+    # Its health = our health.
+    checks["redis"] = await _check_redis()
 
     # Analyzer constructibility.
     checks["analyzer"] = _check_analyzer()
 
-    # Healthy if every check is "ok" or "disabled".
+    # Healthy if every check is "ok" (or "disabled" if we ever add toggles).
     healthy = all(v in ("ok", "disabled") for v in checks.values())
     status = "ready" if healthy else "degraded"
     code = 200 if healthy else 503

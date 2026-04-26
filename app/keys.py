@@ -1,28 +1,41 @@
-"""API key generation, hashing, and storage.
+# pyright: reportGeneralTypeIssues=false
+"""API key generation, hashing, and Redis-backed storage.
 
 Keys are issued in Stripe-style format:
 
     ra_live_<43 random URL-safe chars>
 
 The plaintext key is shown to the admin exactly once, at creation time.
-Only a SHA256 hash is persisted - if cache.db is ever leaked, the
+Only a SHA256 hash is persisted - if our Redis is ever leaked, the
 keys themselves cannot be recovered. Verification on the request path
 hashes the incoming bearer and looks up the hash.
 
-The `ra_` prefix exists so leaked keys can be grep'd from logs, git
-history, and code. The `live_` segment is forward-compatible with a
-future `test_` environment.
+Redis data model:
+
+    next_key_id           - INCR'd counter for assigning new key_ids
+    keyhash:<sha256>      - HASH containing the key's metadata
+                            (key_id, user_id, name, created_at,
+                             last_used_at, active="1"|"0")
+    keyid:<key_id>        - STRING holding the sha256, so we can
+                            revoke by key_id without scanning
+    keys:all              - SET of all key_ids, used by /admin/keys list
+
+The dual indexing (by hash AND by id) costs a little extra storage but
+saves a full keyspace scan on every revoke. Worth it.
+
+Why HSET instead of one JSON blob: HGET/HSET let us update a single
+field (e.g. last_used_at on every auth) without read-modify-write
+race conditions, and Redis is bytes-efficient at this.
 """
 
-import asyncio
 import hashlib
 import logging
 import secrets
-import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
-from app.config import settings
+from app.redis_client import get_redis
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +43,12 @@ logger = logging.getLogger(__name__)
 # more than enough to defeat any brute-force or guessing attack.
 _KEY_RANDOM_BYTES = 32
 _KEY_PREFIX = "ra_live_"
+
+# Redis key prefixes. Centralized so we can audit them at a glance.
+_K_NEXT_ID = "next_key_id"
+_K_BY_HASH = "keyhash:"
+_K_BY_ID = "keyid:"
+_K_ALL = "keys:all"
 
 
 @dataclass(frozen=True)
@@ -76,149 +95,162 @@ def hash_key(plaintext: str) -> str:
 
 
 class KeyStore:
-    """Async-friendly store for hashed API keys.
+    """Redis-backed store for hashed API keys.
 
-    Shares the SQLite file with the analysis cache. We open a fresh
-    connection per operation - same pattern as cache.py - so cross-
-    thread access is safe.
+    All four operations are async and round-trip to Redis once or twice.
+    Latency is dominated by network RTT, so the in-process work is
+    negligible.
     """
 
-    def __init__(self, db_path: str) -> None:
-        self._db_path = db_path
-        self._init_schema()
+    def __init__(self) -> None:
+        # The Redis client is lazily resolved per-call rather than held
+        # as an instance attr. This lets get_redis()'s singleton handle
+        # connection pooling globally instead of us caching a stale
+        # client across reconnects.
+        pass
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._db_path, check_same_thread=False)
-        conn.execute("PRAGMA journal_mode=WAL")
-        return conn
+    async def create(self, user_id: str, name: str) -> IssuedKey:
+        """Mint a new key for a user. Returns the plaintext exactly once.
 
-    def _init_schema(self) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS api_keys (
-                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                    key_hash        TEXT NOT NULL UNIQUE,
-                    user_id         TEXT NOT NULL,
-                    name            TEXT NOT NULL,
-                    created_at      TEXT NOT NULL,
-                    last_used_at    TEXT,
-                    active          INTEGER NOT NULL DEFAULT 1
-                )
-                """
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys (key_hash)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys (user_id)"
-            )
-            conn.commit()
-
-    # --- Sync internals (called via to_thread from async wrappers) ----
-
-    def _create_sync(self, user_id: str, name: str) -> IssuedKey:
+        Three writes (atomic via pipeline): the hash record, the id-to-hash
+        index, and the all-keys set. We INCR first to allocate the id,
+        then write everything else.
+        """
+        client = get_redis()
         plaintext = generate_api_key()
         digest = hash_key(plaintext)
         created_at = datetime.utcnow().isoformat(timespec="seconds")
 
-        with self._connect() as conn:
-            cur = conn.execute(
-                """
-                INSERT INTO api_keys (key_hash, user_id, name, created_at, active)
-                VALUES (?, ?, ?, ?, 1)
-                """,
-                (digest, user_id, name, created_at),
+        key_id = await client.incr(_K_NEXT_ID)
+
+        # Pipeline batches the writes into one round trip. Without this
+        # we'd pay 3x the latency.
+        async with client.pipeline(transaction=True) as pipe:
+            pipe.hset(
+                f"{_K_BY_HASH}{digest}",
+                mapping={
+                    "key_id": str(key_id),
+                    "user_id": user_id,
+                    "name": name,
+                    "created_at": created_at,
+                    "last_used_at": "",  # empty string = never used yet
+                    "active": "1",
+                },
             )
-            conn.commit()
-            assert cur.lastrowid is not None
-            return IssuedKey(
-                plaintext=plaintext,
-                key_id=cur.lastrowid,
-                user_id=user_id,
-                name=name,
-                created_at=created_at,
-            )
+            pipe.set(f"{_K_BY_ID}{key_id}", digest)
+            pipe.sadd(_K_ALL, str(key_id))
+            await pipe.execute()
 
-    def _verify_sync(self, plaintext: str) -> AuthContext | None:
-        digest = hash_key(plaintext)
-        with self._connect() as conn:
-            cur = conn.execute(
-                """
-                SELECT id, user_id, active FROM api_keys
-                WHERE key_hash = ?
-                """,
-                (digest,),
-            )
-            row = cur.fetchone()
-            if row is None:
-                return None
-            key_id, user_id, active = row
-            if not active:
-                return None
-
-            # Touch last_used_at. Best-effort; don't let a write failure
-            # block authentication.
-            try:
-                conn.execute(
-                    "UPDATE api_keys SET last_used_at = ? WHERE id = ?",
-                    (datetime.utcnow().isoformat(timespec="seconds"), key_id),
-                )
-                conn.commit()
-            except sqlite3.Error:
-                logger.exception("api_key_last_used_update_failed")
-
-            return AuthContext(user_id=user_id, key_id=key_id, is_legacy=False)
-
-    def _list_sync(self) -> list[dict]:
-        with self._connect() as conn:
-            cur = conn.execute(
-                """
-                SELECT id, user_id, name, created_at, last_used_at, active
-                FROM api_keys ORDER BY id ASC
-                """
-            )
-            cols = [c[0] for c in cur.description]
-            return [dict(zip(cols, row)) for row in cur.fetchall()]
-
-    def _revoke_sync(self, key_id: int) -> bool:
-        with self._connect() as conn:
-            cur = conn.execute(
-                "UPDATE api_keys SET active = 0 WHERE id = ? AND active = 1",
-                (key_id,),
-            )
-            conn.commit()
-            return cur.rowcount > 0
-
-    # --- Async public API ---------------------------------------------
-
-    async def create(self, user_id: str, name: str) -> IssuedKey:
-        """Mint a new key for a user. Returns the plaintext exactly once."""
-        issued = await asyncio.to_thread(self._create_sync, user_id, name)
         logger.info(
             "api_key_created",
             extra={
-                "key_id": issued.key_id,
-                "user_id": issued.user_id,
-                "key_name": issued.name,
+                "key_id": key_id,
+                "user_id": user_id,
+                "key_name": name,
             },
         )
-        return issued
+
+        return IssuedKey(
+            plaintext=plaintext,
+            key_id=key_id,
+            user_id=user_id,
+            name=name,
+            created_at=created_at,
+        )
 
     async def verify(self, plaintext: str) -> AuthContext | None:
         """Look up a bearer string, return AuthContext if valid and active."""
-        return await asyncio.to_thread(self._verify_sync, plaintext)
+        client = get_redis()
+        digest = hash_key(plaintext)
+        record = await client.hgetall(f"{_K_BY_HASH}{digest}")
 
-    async def list(self) -> list[dict]:
-        """Return all keys (without hashes or plaintexts)."""
-        return await asyncio.to_thread(self._list_sync)
+        if not record:
+            return None
+        if record.get("active") != "1":
+            return None
+
+        key_id = int(record["key_id"])
+        user_id = record["user_id"]
+
+        # Best-effort touch of last_used_at. We don't await it strictly -
+        # if it fails, log and proceed; auth has already succeeded.
+        try:
+            await client.hset(
+                f"{_K_BY_HASH}{digest}",
+                "last_used_at",
+                datetime.utcnow().isoformat(timespec="seconds"),
+            )
+        except Exception:  # noqa: BLE001 - last_used is best-effort
+            logger.exception("api_key_last_used_update_failed")
+
+        return AuthContext(user_id=user_id, key_id=key_id, is_legacy=False)
+
+    async def list(self) -> list[dict[str, Any]]:
+        """Return all keys (without hashes or plaintexts).
+
+        Iterates the all-keys set and HGETALLs each. For our scale
+        (single-digit to low-double-digit keys) this is fine; if we
+        ever had thousands of keys we'd switch to paginated SCAN.
+        """
+        client = get_redis()
+        ids = await client.smembers(_K_ALL)
+
+        if not ids:
+            return []
+
+        # Fetch all keys' metadata in one round trip via pipeline.
+        async with client.pipeline(transaction=False) as pipe:
+            for kid in ids:
+                pipe.get(f"{_K_BY_ID}{kid}")
+            digests = await pipe.execute()
+
+        async with client.pipeline(transaction=False) as pipe:
+            for digest in digests:
+                if digest:
+                    pipe.hgetall(f"{_K_BY_HASH}{digest}")
+                else:
+                    pipe.hgetall("__never_exists__")  # placeholder slot
+            records = await pipe.execute()
+
+        result: list[dict[str, Any]] = []
+        for record in records:
+            if not record:
+                continue
+            result.append(
+                {
+                    "id": int(record["key_id"]),
+                    "user_id": record["user_id"],
+                    "name": record["name"],
+                    "created_at": record["created_at"],
+                    "last_used_at": record.get("last_used_at") or None,
+                    "active": int(record.get("active", "0")),
+                }
+            )
+
+        # Sort ascending by id so output matches the SQLite version
+        # and is stable across calls.
+        result.sort(key=lambda r: r["id"])
+        return result
 
     async def revoke(self, key_id: int) -> bool:
-        """Mark a key inactive. Returns False if no such key existed."""
-        revoked = await asyncio.to_thread(self._revoke_sync, key_id)
-        if revoked:
-            logger.info("api_key_revoked", extra={"key_id": key_id})
-        return revoked
+        """Mark a key inactive. Returns False if no such active key existed."""
+        client = get_redis()
+        digest = await client.get(f"{_K_BY_ID}{key_id}")
+
+        if digest is None:
+            return False
+
+        # Check current state and flip atomically. We can't do this in
+        # one Redis command, so we use HGET + HSET. Race window is tiny
+        # (single-admin use case) and the worst outcome is a "revoked
+        # twice = first one wins" which is what we want anyway.
+        current = await client.hget(f"{_K_BY_HASH}{digest}", "active")
+        if current != "1":
+            return False
+
+        await client.hset(f"{_K_BY_HASH}{digest}", "active", "0")
+        logger.info("api_key_revoked", extra={"key_id": key_id})
+        return True
 
 
 # --- Module-level singleton ------------------------------------------------
@@ -233,9 +265,6 @@ def get_keystore() -> KeyStore:
     """
     global _keystore_instance
     if _keystore_instance is None:
-        _keystore_instance = KeyStore(settings.cache_db_path)
-        logger.info(
-            "keystore_initialized",
-            extra={"path": settings.cache_db_path},
-        )
+        _keystore_instance = KeyStore()
+        logger.info("keystore_initialized")
     return _keystore_instance

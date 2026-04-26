@@ -20,7 +20,7 @@ from app.config import settings
 from app.downloader import download_reel
 from app.errors import ReelAnalyzerError
 from app.health import router as health_router
-from app.keys import AuthContext, get_keystore
+from app.keys import AuthContext
 from app.logging_config import (
     Event,
     bind_request_context,
@@ -28,6 +28,7 @@ from app.logging_config import (
     configure_logging,
 )
 from app.rate_limit import RateLimitExceeded, get_rate_limiter
+from app.redis_client import close_redis, get_redis
 from app.schemas import SCHEMA_VERSION, ReelAnalysis
 from app.validators import validate_prompt, validate_reel_url
 
@@ -40,23 +41,27 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Startup + shutdown hook.
 
-    Eagerly constructs the cache + keystore so their schemas exist
-    before /ready is ever called. Without this, a /ready hit before
-    any real request would report "no such table" because the
-    singletons (and therefore _init_schema) only run on first use.
-    Matters for deploys where the platform health-checks before
-    sending real traffic.
+    Pings Redis on startup so misconfigured REDIS_URL fails fast and
+    visibly during deploy, instead of confusingly on the first request.
+    Closes the connection pool on shutdown so we don't leak sockets.
     """
+    from typing import Awaitable, cast
+
     # Startup
-    if get_cache() is not None:
-        logger.info("startup_cache_ready")
-    get_keystore()
-    logger.info("startup_keystore_ready")
+    redis = get_redis()
+    try:
+        await cast(Awaitable[bool], redis.ping())
+        logger.info("startup_redis_ready")
+    except Exception:
+        logger.exception("startup_redis_unreachable")
+        # Don't crash startup - /ready will report degraded.
+        # Render's healthcheck on /health stays 200 so the container
+        # doesn't get restart-looped while you fix the env var.
 
     yield  # app runs here
 
-    # Shutdown — nothing to clean up right now, but this is where
-    # we'd close DB pools, flush caches, etc. if we ever needed to.
+    # Shutdown
+    await close_redis()
 
 
 app = FastAPI(
