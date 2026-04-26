@@ -172,6 +172,10 @@ app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_body_bytes)
 app.include_router(health_router)
 app.include_router(admin_router)
 
+from app.onboard import router as onboard_router  # noqa: E402
+
+app.include_router(onboard_router)
+
 
 # --- Models ----------------------------------------------------------------
 

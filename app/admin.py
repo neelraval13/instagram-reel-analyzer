@@ -24,12 +24,14 @@ from fastapi import (
     APIRouter,
     Depends,
     HTTPException,
+    Request,
     status,
 )
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
 from app.config import settings
+from app.invites import get_invite_store
 from app.keys import get_keystore
 
 logger = logging.getLogger(__name__)
@@ -151,3 +153,55 @@ async def revoke_key(
             detail=f"No active key with id {key_id}",
         )
     return RevokeResponse(revoked=True, key_id=key_id)
+
+
+# --- Invite endpoints ------------------------------------------------------
+
+
+class CreateInviteRequest(BaseModel):
+    user_id: str = Field(min_length=1, max_length=128)
+
+
+class CreateInviteResponse(BaseModel):
+    code: str
+    user_id: str
+    created_at: str
+    onboard_url: str
+
+
+class InviteMetadata(BaseModel):
+    code: str
+    user_id: str
+    used: int
+    created_at: str
+    redeemed_at: str | None
+    redeemed_by_key_id: int | None
+
+
+@router.post(
+    "/invites",
+    response_model=CreateInviteResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_invite(
+    request: CreateInviteRequest,
+    fastapi_request: Request,
+    _admin: None = Depends(verify_admin_token),
+) -> CreateInviteResponse:
+    """Generate a single-use invite code for a specific user_id."""
+    invite = await get_invite_store().create(user_id=request.user_id)
+    base_url = str(fastapi_request.base_url).rstrip("/")
+    onboard_url = f"{base_url}/onboard?code={invite.code}"
+    return CreateInviteResponse(
+        code=invite.code,
+        user_id=invite.user_id,
+        created_at=invite.created_at,
+        onboard_url=onboard_url,
+    )
+
+
+@router.get("/invites", response_model=list[InviteMetadata])
+async def list_invites(
+    _admin: None = Depends(verify_admin_token),
+) -> list[dict[str, Any]]:
+    return await get_invite_store().list()

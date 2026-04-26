@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     # remote key management.
     admin_token: str = ""
 
+    # iCloud Shortcut share URL. Embedded in the /onboard page so users
+    # can install the Shortcut with one tap. Set to empty to hide the
+    # install link in the UI.
+    shortcut_install_url: str = ""
+
     model_config = {
         "env_file": ".env.local",
         "env_file_encoding": "utf-8",
