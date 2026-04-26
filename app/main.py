@@ -176,6 +176,10 @@ from app.onboard import router as onboard_router  # noqa: E402
 
 app.include_router(onboard_router)
 
+from app.admin_dashboard import router as admin_dashboard_router  # noqa: E402
+
+app.include_router(admin_dashboard_router)
+
 
 # --- Models ----------------------------------------------------------------
 

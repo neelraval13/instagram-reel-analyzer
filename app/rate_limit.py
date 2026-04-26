@@ -43,6 +43,8 @@ WindowKind = Literal["minute", "day"]
 # Redis key prefixes
 _K_RL_MINUTE = "rl:m:"  # rl:m:<user>:<YYYY-MM-DDTHH:MM>
 _K_RL_DAY = "rl:d:"  # rl:d:<user>:<YYYY-MM-DD>
+_K_USAGE = "usage:"  # usage:<user>:<YYYY-MM-DD>  (permanent, no TTL)
+_K_USAGE_USERS = "usage:users"  # SET of user_ids that have ever used the API
 
 # TTLs are slightly longer than the window to avoid edge-case off-by-one
 # wraparound. Redis applies expirations lazily anyway, so a few extra
@@ -131,18 +133,24 @@ class RateLimiter:
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         minute_key = f"{_K_RL_MINUTE}{user_id}:{_minute_window(now)}"
         day_key = f"{_K_RL_DAY}{user_id}:{_day_window(now)}"
+        usage_key = f"{_K_USAGE}{user_id}:{_day_window(now)}"
 
-        # Pipeline both increments + their TTLs. One round trip.
+        # Pipeline both increments + their TTLs + the permanent usage
+        # counter + the user-set membership. One round trip.
         # EXPIRE is idempotent - calling it on an existing key resets
         # the TTL, which is fine since we want it to outlive the window.
+        # The usage_key has NO TTL - it's permanent history.
         async with client.pipeline(transaction=False) as pipe:
             pipe.incr(minute_key)
             pipe.expire(minute_key, _TTL_MINUTE_SECONDS)
             pipe.incr(day_key)
             pipe.expire(day_key, _TTL_DAY_SECONDS)
+            pipe.incr(usage_key)
+            pipe.sadd(_K_USAGE_USERS, user_id)
             results = await pipe.execute()
 
-        # results is [minute_count, expire_ok, day_count, expire_ok]
+        # results is [minute_count, expire_ok, day_count, expire_ok,
+        #             usage_count, sadd_added]
         minute_count = int(results[0])
         day_count = int(results[2])
 
