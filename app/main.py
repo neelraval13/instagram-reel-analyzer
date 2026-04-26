@@ -17,6 +17,7 @@ from app.cache import FREEFORM_MODE, extract_shortcode, get_cache
 from app.config import settings
 from app.downloader import download_reel
 from app.errors import PayloadTooLargeError, ReelAnalyzerError
+from app.health import router as health_router
 from app.keys import AuthContext
 from app.logging_config import (
     Event,
@@ -135,6 +136,8 @@ app.add_middleware(RequestContextMiddleware)
 # OUTERMOST - Starlette applies middleware in reverse-add order, so the
 # last-added middleware sees the request first.
 app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_body_bytes)
+
+app.include_router(health_router)
 
 
 # --- Models ----------------------------------------------------------------
