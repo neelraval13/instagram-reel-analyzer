@@ -1,6 +1,38 @@
+# Virtual environments
 venv/
+.venv/
+
+# Python cache
 __pycache__/
 *.pyc
+*.pyo
+
+# Local state — must NEVER end up in a built image
+.env
 .env.local
+.env.*
+cache.db
+cache.db-shm
+cache.db-wal
+*.sqlite
+*.sqlite3
+
+# Git / IDE / OS artifacts
 .git/
-main.py
+.gitignore
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.egg-info/
+dist/
+build/
+
+# Tests + tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage

@@ -1,8 +1,8 @@
-yt-dlp
-google-genai
-fastapi
-uvicorn
-pydantic-settings
-tenacity
-httpx
-structlog
+yt-dlp==2026.3.17
+google-genai==1.73.1
+fastapi==0.136.0
+uvicorn==0.45.0
+pydantic-settings==2.14.0
+tenacity==9.1.4
+httpx==0.28.1
+structlog==25.5.0
