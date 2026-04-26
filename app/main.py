@@ -3,6 +3,7 @@ import logging
 import os
 import secrets
 import time
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import Depends, FastAPI, Request
@@ -17,9 +18,9 @@ from app.auth import verify_api_key
 from app.cache import FREEFORM_MODE, extract_shortcode, get_cache
 from app.config import settings
 from app.downloader import download_reel
-from app.errors import PayloadTooLargeError, ReelAnalyzerError
+from app.errors import ReelAnalyzerError
 from app.health import router as health_router
-from app.keys import AuthContext
+from app.keys import AuthContext, get_keystore
 from app.logging_config import (
     Event,
     bind_request_context,
@@ -34,9 +35,34 @@ from app.validators import validate_prompt, validate_reel_url
 configure_logging()
 logger = logging.getLogger(__name__)
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup + shutdown hook.
+
+    Eagerly constructs the cache + keystore so their schemas exist
+    before /ready is ever called. Without this, a /ready hit before
+    any real request would report "no such table" because the
+    singletons (and therefore _init_schema) only run on first use.
+    Matters for deploys where the platform health-checks before
+    sending real traffic.
+    """
+    # Startup
+    if get_cache() is not None:
+        logger.info("startup_cache_ready")
+    get_keystore()
+    logger.info("startup_keystore_ready")
+
+    yield  # app runs here
+
+    # Shutdown — nothing to clean up right now, but this is where
+    # we'd close DB pools, flush caches, etc. if we ever needed to.
+
+
 app = FastAPI(
     title="Reel Analyzer",
     description="Analyze Instagram Reels with AI",
+    lifespan=lifespan,
 )
 
 
